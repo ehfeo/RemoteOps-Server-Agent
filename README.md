@@ -36,6 +36,10 @@ RemoteOps Server Agent 是一个用纯 PowerShell 编写的 HTTP 命令执行 Ag
 2. 用任意 HTTP 客户端以 `X-Agent-Token: <密码>` 请求头访问。
 3. 未带密码或密码错误返回 HTTP 403；`/howto` 不需要密码，返回完整接口说明。
 
+> 单文件即可运行，且 `agent.ps1` 是自举的（见下）。`scripts/` 目录里提供可选配套脚本：
+> `start-agent.bat`（交互式启动）、`start-agent.ps1`（启动器）、`stop-agent.bat` / `stop-agent.ps1`（停止）、
+> `watch-agent.bat` / `watch-agent.ps1`（实时日志）。
+
 ### 接口一览
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -95,6 +99,10 @@ an ideal remote-ops entry point for AI assistants and scripts on Windows.
 1. Run `start-agent.bat` as Administrator, set the port and connection password.
 2. Access with header `X-Agent-Token: <password>` on every request.
 3. Missing/wrong password returns HTTP 403; `/howto` needs no password and returns the full API manual.
+
+> The single file `agent.ps1` is all you need, and it is self-boosting (see below). Optional helpers live
+> in `scripts/`: `start-agent.bat` (interactive launcher), `start-agent.ps1` (launcher backend),
+> `stop-agent.bat` / `stop-agent.ps1` (stop), `watch-agent.bat` / `watch-agent.ps1` (live log tail).
 
 ### Endpoints
 | Method | Path | Description |
