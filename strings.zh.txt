@@ -1,0 +1,79 @@
+# ============================================================
+#  RemoteOps Server Agent - 中文界面文案
+#
+#  编码：UTF-8。可以直接用记事本改，改完下次启动生效。
+#  为什么放在 .txt 里而不是写进 .ps1：
+#    PowerShell 5.1 及以下会把无 BOM 的 .ps1 当 GBK 解析，
+#    中文写进脚本本体可能让整个脚本崩溃。
+#  所以文案全部放这里，脚本读进来用；
+#  文件丢了、或者某一条丢了，都会自动回退成英文，不会报错。
+# ============================================================
+
+# ---- 启动器 ----
+launcher.title=RemoteOps Server Agent - 启动器
+launcher.dir=目录
+launcher.failTitle=启动失败
+
+# ---- 交互提问 ----
+ask.port=监听端口
+ask.allow=仅允许来自此 IP 访问
+ask.allowHint1=可选：只允许某一个来源 IP 连接（不支持网段写法）。
+ask.allowHint2=直接回车 = 不限制，任何知道密码的机器都能连。
+ask.passwordIntro=接下来设置连接密码：输入时不可见，并且要输入两次，防止打错把自己锁在外面。
+ask.starting=正在启动 agent ...
+
+# ---- 密码 ----
+ask.password1=请设置连接密码（输入不可见）
+ask.password2=请再输入一次确认（输入不可见）
+ok.passwordAccepted=密码已确认。
+label.password=连接密码
+err.emptyPassword=错误：密码不能为空。
+err.mismatch=错误：两次输入的密码不一致，未做任何改动。
+warn.generatedPassword=你没有指定密码，已自动生成一个随机密码。
+warn.nonInteractive=警告：当前 PowerShell 处于非交互模式，无法弹出密码输入框。
+warn.nonInteractiveHint=（通常是因为调用方加了 -NonInteractive 参数）
+warn.reuseToken=将复用 token.txt 里已有的密码：
+err.noPassword=错误：没有提供密码，且 token.txt 为空。
+err.runInstead=请改用下面这条命令启动：
+
+# ---- 启动过程 ----
+label.urlReserve=检查 URL 保留项
+ok.reserved=已保留
+ok.alreadyReserved=已存在，无需处理
+warn.reserveFailed=警告：无法保留该 URL：
+warn.needAdmin=请用「以管理员身份运行」重新启动本脚本。
+label.stopping=正在停止旧 agent ...
+label.launching=启动 agent（后台隐藏运行）...
+label.pid=进程 PID=
+label.probing=健康检查 ...
+ok.probe=正常
+err.notAnswering=agent 没有响应。请运行 watch-agent.bat 查看日志。
+label.localIps=本机 IP
+warn.noAllowFrom=警告：未设置来源 IP 白名单，任何知道密码的机器都能连接。
+ok.running=agent 已启动。
+label.publicIp=检测到公网 IP
+label.noPublicIp=无（无法访问外网 HTTP）
+label.reachable=可访问地址
+
+# ---- 交接文本 ----
+handoff.begin================= 从下面这一行开始复制 ================
+handoff.end================= 复制到上面这一行为止 ================
+handoff.paste=把这一整块复制下来，粘贴给你的 AI 助手。
+handoff.secret=注意：里面包含明文密码，不要发到任何公开场合。
+handoff.savedTo=同时已保存到文件：
+
+# ---- 活动日志窗口 ----
+watch.opened=已打开活动日志窗口（关掉它不会停止 agent）。
+watch.title=RemoteOps Agent - 活动日志（关闭本窗口不会停止 agent）
+watch.waiting=等待 agent.log 生成 ...
+watch.following=正在实时跟踪 agent.log（Ctrl+C 退出，关窗口不影响 agent）：
+watch.missing=找不到 agent.log：
+
+# ---- 结束提示 ----
+end.line1=把上面那块文字整块复制，粘贴给你的 AI 助手即可。
+end.line2=里面已经写好了地址、说明文档地址和密码，不用再手动输入任何东西。
+end.line3=其中包含密码，请勿公开发布。
+end.line4=如果外网连不上：云厂商的安全组也要放行这个端口的 TCP 入站。
+end.line5=想知道 AI 在服务器上做了什么，双击 watch-agent.bat 看实时日志。
+end.fail1=agent 没有启动成功。
+end.fail2=兜底办法 - 把密码直接写在命令行上启动：

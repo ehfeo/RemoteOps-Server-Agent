@@ -1,0 +1,6 @@
+{
+  "_comment": "copy to agent-config.json and fill in; or just use --host/--token on the CLI",
+  "host": "192.168.1.50",
+  "port": 8765,
+  "token": "PASTE_THE_TOKEN_PRINTED_BY_install-agent.bat"
+}

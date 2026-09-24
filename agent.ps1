@@ -37,11 +37,15 @@ param(
     [int]      $DefaultTimeout = 120,
     [int]      $MaxTimeout     = 900,
     [string]   $CertThumbprint = '',
-    [switch]   $NoLog
+    [switch]   $NoLog,
+    # Internal. When set, this process acts as a per-request worker (a runspace
+    # spawned by the listener thread). It loads all functions/state, then returns
+    # WITHOUT starting its own listener. Used by the concurrent-accept loop below.
+    [switch]   $ThreadWorker
 )
 
 $ErrorActionPreference = 'Stop'
-$AgentVersion = '1.5'
+$AgentVersion = '2.1'
 
 # ---------------------------------------------------------------- setup
 
@@ -218,6 +222,147 @@ function Test-RequestAuth {
     return $true
 }
 
+# ---------------------------------------------------------------- fail2ban
+#
+# Brute-force protection, tracked per source IP. After $script:FailMax failed
+# auths inside $script:FailWindow seconds, the IP is locked out for
+# $script:FailLockSec (several endpoints then return HTTP 429).
+# Workers run in separate runspaces and cannot share memory, so the ban table
+# lives in agent.fail.json (a small file beside the agent) guarded by a named
+# mutex. That keeps it correct across all concurrent workers AND across /reload.
+
+$script:FailFile    = Join-Path $WorkDir 'agent.fail.json'
+$script:FailMutexNm = 'Local\pws-agent-fail-' + $WorkDir.GetHashCode().ToString('x8')
+$script:FailMax     = 5      # failed attempts allowed
+$script:FailWindow  = 300    # ... within this many seconds
+$script:FailLockSec = 900    # lockout duration once exceeded (seconds)
+
+function Get-FailState {
+    $base = @{ maxAttempts=$script:FailMax; windowSec=$script:FailWindow; lockSec=$script:FailLockSec }
+    if (Test-Path $script:FailFile) {
+        try { $o = Get-Content $script:FailFile -Raw | ConvertFrom-Json } catch { $o = $null }
+        if ($o) {
+            if ($null -ne $o.maxAttempts) { $base.maxAttempts = [int]$o.maxAttempts }
+            if ($null -ne $o.windowSec)   { $base.windowSec   = [int]$o.windowSec }
+            if ($null -ne $o.lockSec)     { $base.lockSec     = [int]$o.lockSec }
+            $base.fails = Convert-FailsToHashtable $o.fails
+            return $base
+        }
+    }
+    $base.fails = @{}
+    return $base
+}
+
+function Save-FailState {
+    param($State)
+    try {
+        [System.IO.File]::WriteAllText($script:FailFile, ($State | ConvertTo-Json -Compress -Depth 8),
+                                       (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+
+# Rebuild the fails map as a hashtable. In-memory it is a Hashtable (use .Keys);
+# read back from JSON it is a PSCustomObject (use .PSObject.Properties). Never use
+# .PSObject.Properties on a Hashtable - it yields structural props (Count, Keys, ...).
+function Convert-FailsToHashtable {
+    param($Fails)
+    $h = @{}
+    if ($null -eq $Fails) { return $h }
+    if ($Fails -is [System.Collections.Hashtable]) {
+        foreach ($k in $Fails.Keys) {
+            $v = $Fails[$k]
+            if ($v -is [System.Management.Automation.PSCustomObject]) {
+                $h[$k] = @{ count=[int]$v.count; first=[int]$v.first; banUntil=[int]$v.banUntil }
+            } else { $h[$k] = $v }
+        }
+    } else {
+        foreach ($k in @($Fails.PSObject.Properties)) {
+            $v = $k.Value
+            if ($v -is [System.Management.Automation.PSCustomObject]) {
+                $h[$k.Name] = @{ count=[int]$v.count; first=[int]$v.first; banUntil=[int]$v.banUntil }
+            } else { $h[$k.Name] = $v }
+        }
+    }
+    return $h
+}
+
+function Update-FailState {
+    # Serialize read-modify-write across concurrent worker runspaces.
+    param([string]$Ip, [ValidateSet('fail','ok')]$Action)
+    if (-not $Ip) { return }
+    $m = $null
+    try { $m = New-Object System.Threading.Mutex($false, $script:FailMutexNm) } catch { }
+    try { if ($m) { [void] $m.WaitOne(3000) } } catch { }
+    $dirty = $false
+    try {
+        $s   = Get-FailState
+        $now = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $fails = Convert-FailsToHashtable $s.fails
+        $dirty = $true
+        if ($Action -eq 'ok') {
+            # only write when the IP actually had recorded failures
+            if ($fails.ContainsKey($Ip)) { $fails.Remove($Ip) } else { $dirty = $false }
+        } else {
+            $e = $null
+            if ($fails.ContainsKey($Ip)) { $e = $fails[$Ip] }
+            if ($null -eq $e) { $e = @{ count=0; first=$now; banUntil=0 } }
+            if ([int]$e.count -eq 0 -or ($now - [int]$e.first) -gt $script:FailWindow) { $e.first = $now; $e.count = 0 }
+            $e.count = [int]$e.count + 1
+            if ([int]$e.count -ge $script:FailMax) { $e.banUntil = $now + $script:FailLockSec }
+            $fails[$Ip] = $e
+        }
+        # prune entries that are neither in lockout nor counted within the window
+        $pruned = @{}
+        foreach ($k in @($fails.Keys)) {
+            $v = $fails[$k]
+            if ([int]$v.banUntil -gt $now) { $pruned[$k] = $v; continue }
+            if (($now - [int]$v.first) -le $script:FailWindow -and [int]$v.count -gt 0) { $pruned[$k] = $v; continue }
+        }
+        $s.fails = $pruned
+        if ($dirty) { Save-FailState $s }
+    } catch { }
+    finally { try { if ($m) { $m.ReleaseMutex(); $m.Dispose() } } catch { } }
+}
+
+function Get-BanUntil {
+    param([string]$Ip)
+    if (-not $Ip) { return 0 }
+    $s = Get-FailState
+    if ($s.fails -and $s.fails.ContainsKey($Ip)) {
+        $e   = $s.fails[$Ip]
+        $now = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        if ([int]$e.banUntil -gt $now) { return [int]$e.banUntil }
+    }
+    return 0
+}
+
+function Test-Banned {
+    param([string]$Ip)
+    return ((Get-BanUntil $Ip) -gt 0)
+}
+
+function Get-FailSummary {
+    $s   = Get-FailState
+    $now = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $list = @()
+    if ($s.fails) {
+        foreach ($k in $s.fails.Keys) {
+            $v = $s.fails[$k]
+            $list += @{ ip=$k; count=[int]$v.count; first=[int]$v.first; banUntil=[int]$v.banUntil }
+        }
+    }
+    return @{ maxAttempts=[int]$s.maxAttempts; windowSec=[int]$s.windowSec; lockSec=[int]$s.lockSec;
+              now=$now; failures=$list }
+}
+
+function Clear-FailAll {
+    $m = $null
+    try { $m = New-Object System.Threading.Mutex($false, $script:FailMutexNm) } catch { }
+    try { if ($m) { [void] $m.WaitOne(3000) } } catch { }
+    try { if (Test-Path $script:FailFile) { Remove-Item $script:FailFile -Force -ErrorAction SilentlyContinue } } catch { }
+    finally { try { if ($m) { $m.ReleaseMutex(); $m.Dispose() } } catch { } }
+}
+
 function ConvertFrom-JsonSafe {
     param([string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
@@ -387,6 +532,14 @@ function Get-HowToEndpoints {
            purpose='Liveness probe and the fastest way to test a password.';
            params='none';
            returns='{"ok":true,"version":"1.2","hostname":"...","time":"...","peer":"..."}' }
+        @{ method='GET';  path='/fail';    auth='password';
+           purpose='fail2ban state: who is counted/locked out for brute force.';
+           params='none (GET)';
+           returns='{"maxAttempts":5,"windowSec":300,"lockSec":900,"now":...,"failures":[...]}' }
+        @{ method='POST'; path='/fail';    auth='password';
+           purpose='Admin the ban table. {"action":"clear"} resets all; {"action":"unban","ip":"x.x.x.x"} clears one IP.';
+           params='JSON body';
+           returns='Updated fail2ban state' }
         @{ method='GET';  path='/info';    auth='password';
            purpose='Environment summary: OS, PS version, admin flag, disks, MySQL services.';
            params='none';
@@ -472,6 +625,9 @@ function Get-HowToRules {
       ,'Wrong or missing password returns HTTP 403 with {"ok":false,"error":"forbidden"}. It is not a network error.'
       ,'A /exec command is written to a temporary .bat and run with "cmd /c". Therefore batch syntax applies: a for loop variable must be written %%i, not %i.'
       ,'The default shell for /exec is cmd. Pass {"shell":"powershell"} to run PowerShell instead.'
+      ,'When to STOP fighting quoting: if a powershell command contains & | < > @ $, single or double quotes, backslashes, newlines, or a leading param() block, it will only cause painful escaping mistakes. Do NOT inline-interpolate it into your shell as a JSON string. Put the script text in a local file and POST it with "curl --data-binary @file.ps1 /script?shell=powershell". The agent runs bombs-free either way, but /script saves YOU the escaping/parsing round-trips.'
+      ,'Same rule for /exec: write the JSON body to a file (e.g. bodies/cmd.json) and send it with "curl --data-binary @bodies/cmd.json". Never build the JSON inline in a shell that may eat & @ " yourself.'
+      ,'Brute-force protection: after 5 wrong X-Agent-Token from one IP within 300s, that IP is locked for 900s and every protected endpoint returns HTTP 429 {"ok":false,"code":"throttled"}. /howto needs no password and is never counted. GET /fail shows the table; POST /fail {"action":"clear"} or {"action":"unban","ip":"x.x.x.x"} clears it.'
       ,'stdin is closed immediately. Never send interactive commands and never use Read-Host or pause.'
       ,'Default timeout is 120 seconds, hard maximum 900. Pass an explicit timeout for long jobs such as installs or database initialization.'
       ,'Exit code is passed through in exitCode, but some Windows tools are unreliable: verify the actual effect rather than trusting exitCode alone.'
@@ -561,6 +717,23 @@ function Get-HowTo {
             markdownChinese = '/howto?format=md&lang=zh'
             health   = '/health'
         }
+        aiPrompt = @{
+            title  = 'AI Assistant bootstrap prompt - copy everything inside the box into your AI, then give it HOST, PORT and the password.'
+            prompt = @(
+                'You are talking to a RemoteOps Server Agent on a Windows machine.'
+                'It is a zero-dependency PowerShell HTTP agent (no installer). It runs the commands you send it, as the Windows account that started it (usually Administrator).'
+                ''
+                ('Agent version: v' + $AgentVersion + '. Base URL: http://HOST:PORT.')
+                ''
+                'To work with it:'
+                '1. Put the connection password in the HTTP header X-Agent-Token on EVERY request except /howto.'
+                '2. HOST, PORT and PASSWORD are given to you by the human. GET /health to confirm the password, then GET /howto?format=md for the full manual.'
+                '3. Small one-liners: POST /exec with {"cmd":"...","shell":"cmd|powershell","timeout":120}.'
+                "4. Anything containing & | < > @ $, quotes, backslashes, newlines, or a leading param() block: put the text in a file and POST it via /script (?shell=powershell) with --data-binary @file. Never inline-interpolate such commands - you will fight quoting."
+                '5. Verify actual effects, not just exitCode: Windows tools sometimes exit 0 anyway.'
+                '6. Wrong or missing password returns HTTP 403; after 5 failures the IP is locked and returns HTTP 429 for 900s.'
+            ) -join "`n"
+        }
     }
 }
 
@@ -626,6 +799,14 @@ function Get-HowToMarkdown {
     $L += '---'
     $L += 'This agent executes commands as the Windows account that started it, usually Administrator.'
     $L += 'Stop it (stop-agent.bat) when the job is done.'
+    $L += ''
+    $L += '## 8. AI Assistant Prompt (copy everything in the box)'
+    $L += ''
+    $L += 'Paste the block below into your AI (or the start of a new AI thread), then tell it HOST, PORT and the password.'
+    $L += ''
+    $L += '```text'
+    foreach ($ln in ((Get-HowTo).aiPrompt.prompt -split "`n")) { $L += $ln }
+    $L += '```'
     return ($L -join "`n")
 }
 
@@ -799,19 +980,68 @@ function Handle-Request {
         return
     }
 
-    if (-not (Test-RequestAuth $Context)) {
-        Write-Log "DENY $method $path from $peer"
-        Send-Json $Context 403 @{ ok=$false; code='forbidden'; error='forbidden';
-                                  message='forbidden';
-                                  hint='password missing or wrong. Send it in HTTP header X-Agent-Token. GET /howto needs no password and explains everything.' }
+    # fail2ban gate: a locked-out IP never reaches auth (all protected endpoints).
+    if (Test-Banned $peer) {
+        Write-Log "BLOCKED $method $path from $peer (fail2ban lockout)"
+        $bu = Get-BanUntil $peer
+        Send-Json $Context 429 @{ ok=$false; code='throttled'; error='too many failed attempts; temporarily blocked';
+                                  message='too many failed attempts; temporarily blocked';
+                                  lockedUntil=$bu; hint='wait for the lockout to expire, or the administrator clears it via POST /fail' }
         return
     }
+
+    if (-not (Test-RequestAuth $Context)) {
+        # Record the failure, THEN check the ban table. Do not fold them into one
+        # expression: Update-FailState returns nothing, and "-and" short-circuits on
+        # $null so the ban check would never run on the triggering attempt.
+        Update-FailState -Ip $peer -Action 'fail'
+        $nowBanned = Test-Banned $peer
+        Write-Log "DENY $method $path from $peer"
+        if ($nowBanned) {
+            Send-Json $Context 429 @{ ok=$false; code='throttled'; error='too many failed attempts; temporarily blocked';
+                                      message='too many failed attempts; temporarily blocked';
+                                      lockedUntil=(Get-BanUntil $peer); hint='wait for the lockout to expire' }
+        } else {
+            Send-Json $Context 403 @{ ok=$false; code='forbidden'; error='forbidden';
+                                      message='forbidden';
+                                      hint='password missing or wrong. Send it in HTTP header X-Agent-Token. GET /howto needs no password and explains everything.' }
+        }
+        return
+    }
+
+    # Successful auth: forget this IP's prior failures (no-op if it had none).
+    Update-FailState -Ip $peer -Action 'ok'
 
     switch ($path) {
 
         '/health' {
             Send-Json $Context 200 @{ ok=$true; version=$AgentVersion; hostname=$env:COMPUTERNAME;
                                       time=(Get-Date).ToString('s'); peer=$peer }
+            return
+        }
+
+        '/fail' {
+            if ($method -eq 'GET') {
+                Send-Json $Context 200 (Get-FailSummary)
+                return
+            }
+            if ($method -eq 'POST') {
+                $body = Read-Body $Context
+                $o = ConvertFrom-JsonSafe $body
+                if ($o -and $o.action -eq 'clear') {
+                    Clear-FailAll
+                    Send-Json $Context 200 (Get-FailSummary)
+                    return
+                }
+                if ($o -and $o.action -eq 'unban' -and $o.ip) {
+                    Update-FailState -Ip ([string]$o.ip) -Action 'ok'
+                    Send-Json $Context 200 (Get-FailSummary)
+                    return
+                }
+                Send-Json $Context 400 @{ ok=$false; error='expect {"action":"clear"} or {"action":"unban","ip":"x.x.x.x"}' }
+                return
+            }
+            Send-Json $Context 405 @{ ok=$false; error='GET or POST required' }
             return
         }
 
@@ -1082,6 +1312,9 @@ function Handle-Request {
             Write-Log ('>> STOP <- ' + $peer)
             Send-Json $Context 200 @{ ok=$true; stopping=$true }
             $script:StopRequested = $true
+            # The accept loop now runs in a *different* runspace thread, so the in-process
+            # flag alone cannot stop it. Drop a stop-file the listener polls every 400ms.
+            try { New-Item -ItemType File -Path (Join-Path $script:WorkDir 'agent.stop') -Force -ErrorAction SilentlyContinue | Out-Null } catch { }
             return
         }
 
@@ -1128,46 +1361,112 @@ Start-Process -FilePath `$ps -ArgumentList `$a -WindowStyle Hidden
 }
 
 # ---------------------------------------------------------------- main loop
+#
+# v2.0 concurrency fix: each request is handled in its OWN runspace (thread), so
+# a slow or hung command (e.g. a child process that keeps a pipe open) can no
+# longer block the accept loop. /health and every other endpoint stay responsive.
+# The accept loop polls with BeginGetContext (400ms), reaps finished workers, and
+# checks the /stop stop-file between requests. Worker runspaces dot-source this
+# same file with -ThreadWorker, which loads all functions/state but skips this block.
 
-$script:StopRequested = $false
-$scheme = 'http'
-if ($CertThumbprint -ne '') { $scheme = 'https' }
-$prefix = $scheme + '://' + $BindAddress + ':' + $Port + '/'
-$listener = New-Object System.Net.HttpListener
-$listener.Prefixes.Add($prefix)
-$listener.IgnoreWriteExceptions = $true
+if (-not $ThreadWorker) {
 
-try {
-    $listener.Start()
-} catch {
-    Write-Log "FATAL cannot listen on $prefix : $($_.Exception.Message)"
-    Write-Host "FATAL: cannot listen on $prefix"
-    Write-Host "      $($_.Exception.Message)"
-    Write-Host "Hint: run install-agent.bat as Administrator (it reserves the URL with netsh)."
-    exit 1
-}
+    $script:StopRequested = $false
+    $scheme = 'http'
+    if ($CertThumbprint -ne '') { $scheme = 'https' }
+    $prefix = $scheme + '://' + $BindAddress + ':' + $Port + '/'
+    $listener = New-Object System.Net.HttpListener
+    $listener.Prefixes.Add($prefix)
+    $listener.IgnoreWriteExceptions = $true
 
-Write-Log "START pid=$PID prefix=$prefix token=$($(if($Token -ne ''){'yes'}else{'no'})) allowFrom=$($AllowFrom -join ',')"
-Write-Host "agent listening on $prefix"
-
-while ($listener.IsListening -and -not $script:StopRequested) {
-    $ctx = $null
     try {
-        $ctx = $listener.GetContext()
+        $listener.Start()
     } catch {
-        if ($listener.IsListening) { Start-Sleep -Milliseconds 200 }
-        continue
+        Write-Log "FATAL cannot listen on $prefix : $($_.Exception.Message)"
+        Write-Host "FATAL: cannot listen on $prefix"
+        Write-Host "      $($_.Exception.Message)"
+        Write-Host "Hint: run install-agent.bat as Administrator (it reserves the URL with netsh)."
+        exit 1
     }
-    if ($ctx -eq $null) { continue }
-    try {
-        Handle-Request $ctx
-    } catch {
-        $msg = $_.Exception.Message
-        Write-Log "ERROR handling request: $msg"
-        try { Send-Json $ctx 500 @{ ok=$false; error=$msg } } catch { }
-    }
-}
 
-try { $listener.Stop(); $listener.Close() } catch { }
-Write-Log "STOPPED"
-Write-Host "agent stopped"
+    Write-Log "START pid=$PID prefix=$prefix token=$($(if($Token -ne ''){'yes'}else{'no'})) allowFrom=$($AllowFrom -join ',')"
+    Write-Host "agent listening on $prefix"
+
+    $script:AgentFile   = $MyInvocation.MyCommand.Path
+    $script:StopFile    = Join-Path $WorkDir 'agent.stop'
+    $script:Pending     = @()
+    if (Test-Path $script:StopFile) { Remove-Item $script:StopFile -Force -ErrorAction SilentlyContinue }
+
+    # Hand a request + the listener's boot state to a fresh runspace, then run
+    # Handle-Request inside it. Fire-and-forget: the accept loop keeps running.
+    $script:WorkerScript = @'
+param($WorkerCtx)
+if (-not $WorkerCtx -or -not $WorkerCtx.ctx) { return }
+. $WorkerCtx.path -Port $WorkerCtx.port -Token $WorkerCtx.token `
+    -AllowFrom $WorkerCtx.allow -WorkDir $WorkerCtx.workDir `
+    -MaxTimeout $WorkerCtx.maxTimeout -BindAddress $WorkerCtx.bind -ThreadWorker
+Handle-Request $WorkerCtx.ctx
+'@
+
+    function Start-ContextHandler {
+        param([System.Net.HttpListenerContext]$Context)
+        $rs = $null; $ps = $null
+        try {
+            $wk = @{
+                ctx = $Context
+                path = $script:AgentFile
+                port = $Port; token = $Token; bind = $BindAddress
+                allow = @($AllowFrom); workDir = $WorkDir; maxTimeout = $script:MaxTimeout
+            }
+            $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+            $rs.Open()
+            $ps = [System.Management.Automation.PowerShell]::Create()
+            $ps.Runspace = $rs
+            [void] $ps.AddScript($script:WorkerScript)
+            [void] $ps.AddArgument($wk)
+            $sync = $ps.BeginInvoke()
+            $script:Pending = @($script:Pending + @{ ps=$ps; rs=$rs; h=$sync })
+        } catch {
+            Write-Log "ERROR dispatch failed: $($_.Exception.Message)"
+            try { Send-Json $Context 500 @{ ok=$false; error='dispatch failed: ' + $_.Exception.Message } } catch { }
+            try { $rs.Dispose() } catch { }
+            try { $ps.Dispose() } catch { }
+        }
+    }
+
+    # Reap finished workers: EndInvoke, then dispose the runspace to free the thread.
+    function Get-Outstanding {
+        if ($script:Pending.Count -eq 0) { return }
+        $done = @($script:Pending | Where-Object { $_.h.IsCompleted })
+        foreach ($d in $done) {
+            try { [void] $d.ps.EndInvoke($d.h) } catch { }
+            try { $d.ps.Dispose() } catch { }
+            try { $d.rs.Dispose() } catch { }
+        }
+        if ($done.Count) { $script:Pending = @($script:Pending | Where-Object { $_.h.IsCompleted -eq $false }) }
+    }
+
+    $script:Accept = $listener.BeginGetContext($null, $null)
+    while ($true) {
+        try { if (-not $listener.IsListening) { break } } catch { break }
+        Get-Outstanding
+        if (Test-Path $script:StopFile -PathType Leaf) { break }
+        try {
+            if ($script:Accept.AsyncWaitHandle.WaitOne(400)) {
+                $ctx = $null
+                try { $ctx = $listener.EndGetContext($script:Accept) } catch { $ctx = $null }
+                if ($null -ne $ctx) { Start-ContextHandler $ctx }
+                $script:Accept = $listener.BeginGetContext($null, $null)
+            } else {
+                Start-Sleep -Milliseconds 60
+            }
+        } catch {
+            if ($listener.IsListening) { Start-Sleep -Milliseconds 200 }
+        }
+    }
+
+    try { $listener.Stop(); $listener.Close() } catch { }
+    Remove-Item $script:StopFile -Force -ErrorAction SilentlyContinue
+    Write-Log "STOPPED"
+    Write-Host "agent stopped"
+}

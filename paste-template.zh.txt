@@ -1,0 +1,12 @@
+请把下面这段内容复制给你的 AI Agent（一次粘贴即可，它看完就知道该怎么做了）：
+
+请连接 Server Agent：{{URLS}}，可以快速测试TCP连接可达性再GET，5秒连不上直接换下一个IP。
+
+然后发送一个 GET 请求到 {{HOWTO}}
+（这个接口不需要密码）获取完整的接口说明和使用方法。
+
+接口权限密码是：{{PASSWORD}}
+
+补充：密码要放在每一个请求的 HTTP 头 X-Agent-Token 里。
+如果返回 403 forbidden，说明密码没带或不对。
+我是一台 Windows 服务器上的 RemoteOps Server Agent，可以执行你发来的命令。
