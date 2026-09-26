@@ -45,7 +45,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$AgentVersion = '2.1'
+$AgentVersion = '2.2'
 
 # ---------------------------------------------------------------- setup
 
@@ -367,6 +367,50 @@ function ConvertFrom-JsonSafe {
     param([string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
     try { return ($Text | ConvertFrom-Json) } catch { return $null }
+}
+
+# Normalize a path coming from the wire.
+# Clients send every flavour of separator depending on their shell quoting:
+#   C:\Program Files\MySQL   C:/Program Files/MySQL
+#   C://Program Files\\MySQL (doubled separators from shell escaping)
+#   "C:\some dir"            (wrapping quotes that were never stripped)
+#   relative paths           (resolved against the agent work dir)
+# UNC roots (\\server\share) and drive roots (C:\) keep their shape.
+# Returns '' when nothing usable was supplied.
+function ConvertTo-AgentPath {
+    param([string]$Raw)
+    if ($null -eq $Raw) { return '' }
+    $p = $Raw.Trim()
+    if ($p.Length -eq 0) { return '' }
+
+    # strip a single layer of wrapping quotes
+    while ($p.Length -gt 1 -and
+           (($p[0] -eq '"' -and $p[-1] -eq '"') -or ($p[0] -eq "'" -and $p[-1] -eq "'"))) {
+        $p = $p.Substring(1, $p.Length - 2).Trim()
+    }
+    if ($p.Length -eq 0) { return '' }
+
+    $unc = $p.StartsWith('\\')
+    $drive = ($p.Length -ge 2 -and $p[1] -eq ':' -and [char]::IsLetter($p[0]))
+
+    $p = $p.Replace('/', '\')
+    $p = [regex]::Replace($p, '\\{2,}', '\')   # collapse C:\\dir -> C:\dir
+    if ($unc) { $p = '\' + $p }                 # restore UNC double slash
+
+    # root forms must keep their trailing backslash
+    if ($p.Length -eq 2 -and $drive) { $p = $p + '\' }
+    if ($p.Length -eq 1 -and $p -eq '\') { $p = '\' }
+    return $p
+}
+
+# Look up the 'path' query parameter and normalize it in one step.
+function Get-QueryParam {
+    param([string]$Query)
+    $t = ''
+    foreach ($part in $Query.TrimStart('?').Split('&')) {
+        if ($part.StartsWith('path=')) { $t = [System.Net.WebUtility]::UrlDecode($part.Substring(5)) }
+    }
+    return (ConvertTo-AgentPath $t)
 }
 
 # ---------------------------------------------------------------- execution
@@ -1096,12 +1140,7 @@ function Handle-Request {
 
         '/file' {
             if ($method -eq 'GET') {
-                $q = $req.Url.Query.TrimStart('?')
-                $target = ''
-                foreach ($part in $q.Split('&')) {
-                    $kv = $part.Split('=')
-                    if ($kv[0] -eq 'path' -and $kv.Length -gt 1) { $target = [System.Net.WebUtility]::UrlDecode(($part.Substring(5))) }
-                }
+                $target = Get-QueryParam $req.Url.Query
                 if ([string]::IsNullOrWhiteSpace($target) -or -not (Test-Path $target -PathType Leaf)) {
                     Send-Json $Context 404 @{ ok=$false; error='file not found: ' + $target }
                     return
@@ -1118,7 +1157,11 @@ function Handle-Request {
                     Send-Json $Context 400 @{ ok=$false; error='need path + content' }
                     return
                 }
-                $target = [string]$p.path
+                $target = ConvertTo-AgentPath ([string]$p.path)
+                if ([string]::IsNullOrWhiteSpace($target)) {
+                    Send-Json $Context 400 @{ ok=$false; error='need a usable path' }
+                    return
+                }
                 $enc = 'base64'; if ($p.encoding) { $enc = [string]$p.encoding }
                 Write-Log ('>> UPLOAD ' + $target + ' <- ' + $peer)
                 try {
@@ -1139,9 +1182,8 @@ function Handle-Request {
         }
 
         '/tail' {
-            $target = ''; $lines = 200
+            $target = Get-QueryParam $req.Url.Query; $lines = 200
             foreach ($part in $req.Url.Query.TrimStart('?').Split('&')) {
-                if ($part.StartsWith('path='))  { $target = [System.Net.WebUtility]::UrlDecode($part.Substring(5)) }
                 if ($part.StartsWith('lines=')) { try { $lines = [int]$part.Substring(6) } catch { } }
             }
             if ([string]::IsNullOrWhiteSpace($target) -or -not (Test-Path $target -PathType Leaf)) {
@@ -1162,10 +1204,7 @@ function Handle-Request {
         }
 
         '/ls' {
-            $target = '.'
-            foreach ($part in $req.Url.Query.TrimStart('?').Split('&')) {
-                if ($part.StartsWith('path=')) { $target = [System.Net.WebUtility]::UrlDecode($part.Substring(5)) }
-            }
+            $target = Get-QueryParam $req.Url.Query       # '.' below when omitted
             if ([string]::IsNullOrWhiteSpace($target)) { $target = '.' }
             if (-not (Test-Path $target)) { Send-Json $Context 404 @{ ok=$false; error='not found: ' + $target }; return }
             Write-Log ('>> LS ' + $target + ' <- ' + $peer)
@@ -1234,10 +1273,7 @@ function Handle-Request {
 
         '/zip' {
             if ($method -ne 'GET') { Send-Error $Context 405 'method_not_allowed' 'GET only'; return }
-            $target = ''
-            foreach ($part in $req.Url.Query.TrimStart('?').Split('&')) {
-                if ($part.StartsWith('path=')) { $target = [System.Net.WebUtility]::UrlDecode($part.Substring(5)) }
-            }
+            $target = Get-QueryParam $req.Url.Query
             if ([string]::IsNullOrWhiteSpace($target) -or -not (Test-Path $target)) {
                 Send-Error $Context 404 'not_found' 'path not found: ' $target
                 return
@@ -1257,7 +1293,11 @@ function Handle-Request {
                 Send-Error $Context 400 'bad_request' 'need path + content (base64 zip)'
                 return
             }
-            $dest = [string]$p.path
+            $dest = ConvertTo-AgentPath ([string]$p.path)
+            if ([string]::IsNullOrWhiteSpace($dest)) {
+                Send-Error $Context 400 'bad_request' 'need a usable path'
+                return
+            }
             $enc  = 'base64'; if ($p.encoding) { $enc = [string]$p.encoding }
             Write-Log ('>> UNZIP ' + $dest + ' <- ' + $peer)
             try {
